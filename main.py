@@ -29,7 +29,9 @@ workflow = build_workflow(client)
 state: AgentState = {
     "messages": [],
     "last_events": None,
-    "last_emails": None
+    "last_emails": None,
+    "conversation_summary": None,
+    "summarized_message_count": 0,
 }
 class UserRequest(BaseModel):
     message: str
@@ -48,7 +50,9 @@ def send_response(user_request: UserRequest):
                 HumanMessage(content=user_request.message)
             ],
             "last_events": state.get("last_events"),
-            "last_emails": state.get("last_emails")
+            "last_emails": state.get("last_emails"),
+            "conversation_summary": state.get("conversation_summary"),
+            "summarized_message_count": state.get("summarized_message_count", 0),
         })
 
         last_message = state["messages"][-1]

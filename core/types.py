@@ -8,5 +8,6 @@ class AgentState(TypedDict):
     """
     messages: Annotated[list[BaseMessage], operator.add]  
     last_events: list | None   
-    last_emails : list | None                            
-    
+    last_emails : list | None
+    conversation_summary: str | None
+    summarized_message_count: int

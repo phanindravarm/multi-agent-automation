@@ -1,6 +1,6 @@
 from langgraph.prebuilt import ToolNode
 from langgraph.graph import StateGraph, START, END
-from langchain_core.messages import BaseMessage, AIMessage
+from langchain_core.messages import BaseMessage, AIMessage, HumanMessage
 from typing import TypedDict, Annotated
 import operator
 import json
@@ -11,13 +11,15 @@ from google_calendar.tool_config import TOOL_REQUIREMENTS as CALENDAR_TOOL_REQUI
 from google_mail.tool_config import TOOL_REQUIREMENTS as GMAIL_TOOL_REQUIREMENTS
 from datetime import date
 
-
 DESTRUCTIVE_TOOLS = {"delete_event_tool", "delete_email_tool"}
+SUMMARY_WINDOW = 10
 
 class AgentState(TypedDict):
     messages: Annotated[list[BaseMessage], operator.add]
     last_events: list[dict] | None
     last_emails: list[dict] | None
+    conversation_summary: str | None
+    summarized_message_count: int
 
 
 tools_dict = {
@@ -93,8 +95,61 @@ def _extract_tool_payload(message: BaseMessage) -> dict | None:
 
     return None
 
+def _message_to_text(message: BaseMessage) -> str:
+    content = getattr(message, "content", "")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, dict):
+        return json.dumps(content, ensure_ascii=True)
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict):
+                text = item.get("text")
+                if text:
+                    parts.append(str(text))
+        return " ".join(parts)
+    return str(content)
 
-def call_model(state: AgentState, client, tool_node: ToolNode) -> dict:
+
+def _update_conversation_summary(state: AgentState, client, window: int = SUMMARY_WINDOW) -> tuple[str | None, int]:
+    messages = state.get("messages", [])
+    total_messages = len(messages)
+    keep_from = max(0, total_messages - window)
+    already_summarized = state.get("summarized_message_count", 0)
+
+    if keep_from <= already_summarized:
+        return state.get("conversation_summary"), already_summarized
+
+    chunk = messages[already_summarized:keep_from]
+    if not chunk:
+        return state.get("conversation_summary"), already_summarized
+
+    existing_summary = state.get("conversation_summary") or ""
+    chunk_text = "\n".join(
+        f"{getattr(msg, 'type', 'message').upper()}: {_message_to_text(msg)}"
+        for msg in chunk
+    )
+
+    summary_prompt = (
+        "Update the running conversation summary.\n"
+        "Preserve user goals, constraints, pending confirmations, selected IDs, and decisions.\n"
+        "Keep it concise and factual as bullet points.\n\n"
+        f"Existing summary:\n{existing_summary or 'None'}\n\n"
+        f"New conversation chunk:\n{chunk_text}"
+    )
+
+    try:
+        summary_response = client.invoke([HumanMessage(content=summary_prompt)])
+        if isinstance(summary_response.content, str):
+            return summary_response.content, keep_from
+    except Exception:
+        return existing_summary or None, already_summarized
+
+    return existing_summary or None, already_summarized
+
+
+def call_model(state: AgentState, client) -> dict:
     today = date.today()
 
     system_prompt = f"""
@@ -267,8 +322,17 @@ Keep confirmations:
 - Professional
 - Concise
 """
-
-    messages = [{"role": "system", "content": system_prompt}] + state["messages"]
+    conversation_summary, summarized_count = _update_conversation_summary(state, client, window=SUMMARY_WINDOW)
+    recent_messages = state.get("messages", [])[-SUMMARY_WINDOW:]
+    messages = [{"role": "system", "content": system_prompt}]
+    if conversation_summary:
+        messages.append(
+            {
+                "role": "system",
+                "content": f"Conversation summary so far:\n{conversation_summary}",
+            }
+        )
+    messages += recent_messages
 
     client_with_tools = client.bind_tools(list(tools_dict.values()))
     response = client_with_tools.invoke(messages)
@@ -277,7 +341,11 @@ Keep confirmations:
     is_user_confirmed = _is_explicit_confirmation(user_text)
 
     if not response.tool_calls:
-        return {"messages": [response]}
+        return {
+            "messages": [response],
+            "conversation_summary": conversation_summary,
+            "summarized_message_count": summarized_count,
+        }
 
     updated_tool_calls = []
 
@@ -298,7 +366,9 @@ Keep confirmations:
                         AIMessage(
                             content="Are you sure you want to proceed? Please confirm by saying 'yes'."
                         )
-                    ]
+                    ],
+                    "conversation_summary": conversation_summary,
+                    "summarized_message_count": summarized_count,
                 }
             updated_call["args"]["confirm"] = True
 
@@ -319,7 +389,9 @@ Keep confirmations:
                                 AIMessage(
                                     content="Multiple events match that name. Which one would you like to choose?"
                                 )
-                            ]
+                            ],
+                            "conversation_summary": conversation_summary,
+                            "summarized_message_count": summarized_count,
                         }
 
                     if resolved_value:
@@ -341,14 +413,20 @@ Keep confirmations:
                                 f"Please provide: {missing_fields}."
                             )
                         )
-                    ]
+                    ],
+                    "conversation_summary": conversation_summary,
+                    "summarized_message_count": summarized_count,
                 }
 
         updated_tool_calls.append(updated_call)
 
     response.tool_calls = updated_tool_calls
 
-    return {"messages": [response]}
+    return {
+        "messages": [response],
+        "conversation_summary": conversation_summary,
+        "summarized_message_count": summarized_count,
+    }
 
 
 def tool_handler(state: AgentState, tool_node: ToolNode):
@@ -359,6 +437,8 @@ def tool_handler(state: AgentState, tool_node: ToolNode):
         "messages": tool_messages,
         "last_events": state.get("last_events"),
         "last_emails": state.get("last_emails"),
+        "conversation_summary": state.get("conversation_summary"),
+        "summarized_message_count": state.get("summarized_message_count", 0),
     }
 
     for tool_message in tool_messages:
@@ -387,7 +467,7 @@ def build_workflow(client):
 
     tool_node = ToolNode(list(tools_dict.values()))
 
-    workflow.add_node("agent", lambda state: call_model(state, client, tool_node))
+    workflow.add_node("agent", lambda state: call_model(state, client))
     workflow.add_node("tools", lambda state: tool_handler(state, tool_node))
 
     workflow.add_edge(START, "agent")
